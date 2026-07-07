@@ -32,7 +32,7 @@ pub enum SocketCommand {
     SurfaceClose     { req_id: Value, id: String, resp_tx: RespTx },
     SurfaceSendText  { req_id: Value, id: Option<String>, text: String, resp_tx: RespTx },
     SurfaceSendKey   { req_id: Value, id: Option<String>, key: String, resp_tx: RespTx },
-    SurfaceReadText  { req_id: Value, id: Option<String>, resp_tx: RespTx },
+    SurfaceReadText  { req_id: Value, id: Option<String>, scrollback: bool, resp_tx: RespTx },
     SurfaceHealth    { req_id: Value, id: Option<String>, resp_tx: RespTx },
     SurfaceRefresh   { req_id: Value, id: Option<String>, resp_tx: RespTx },
 
@@ -52,6 +52,14 @@ pub enum SocketCommand {
     // -- notification.* (Phase 4: NOTF-01, NOTF-02) --
     NotificationList   { req_id: Value, resp_tx: RespTx },
     NotificationClear  { req_id: Value, id: String, resp_tx: RespTx },
+    NotificationCreate {
+        req_id: Value,
+        title: String,
+        body: String,
+        workspace: Option<String>,
+        desktop: bool,
+        resp_tx: RespTx,
+    },
 
     // -- browser.* (Phase 8: D-04 lifecycle + streaming) --
     BrowserOpen          { req_id: Value, url: String, workspace: Option<String>, resp_tx: RespTx },
