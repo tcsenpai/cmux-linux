@@ -62,7 +62,24 @@ pub enum Commands {
 
     // -- Workspace management --
     /// Create a new workspace
-    NewWorkspace,
+    NewWorkspace {
+        /// Workspace name
+        #[arg(long)]
+        name: Option<String>,
+        /// Working directory for the workspace's terminals
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Declarative layout JSON. Nodes:
+        /// {"type":"terminal","cwd":"...","command":"...","agent":"claude"} or
+        /// {"type":"split","direction":"horizontal|vertical","ratio":0.5,
+        ///  "start":{...},"end":{...}}
+        #[arg(long)]
+        layout: Option<String>,
+        /// Boot a native agent session in the workspace's single pane
+        /// (e.g. "claude"), tracked for resume across restarts
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// Select a workspace by ID
     SelectWorkspace {
         /// Workspace UUID
@@ -137,6 +154,10 @@ pub enum Commands {
         /// Target surface ID (default: focused)
         #[arg(long)]
         id: Option<String>,
+        /// Read the full screen buffer including scrollback history,
+        /// not just the visible viewport
+        #[arg(long)]
+        scrollback: bool,
     },
     /// Check surface health
     Health {
@@ -186,11 +207,98 @@ pub enum Commands {
         id: String,
     },
 
+    /// Set a workspace's colored status pill in the sidebar (empty state clears)
+    SetStatus {
+        /// Status text, e.g. "working", "done", "error"
+        state: String,
+        /// Pill background color (hex or named), e.g. "#1565C0"
+        #[arg(long, default_value = "#546E7A")]
+        color: String,
+        /// Target workspace UUID (default: active workspace)
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Set a workspace's sidebar progress bar (negative value clears)
+    SetProgress {
+        /// Progress 0.0–1.0
+        value: f64,
+        /// Text shown on the bar
+        #[arg(long)]
+        label: Option<String>,
+        /// Target workspace UUID (default: active workspace)
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Set a workspace's one-line sidebar log (empty message clears)
+    Log {
+        /// Log message
+        message: String,
+        /// Target workspace UUID (default: active workspace)
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Raise a cmux notification (marks workspace attention, fires
+    /// notification.created for event subscribers, desktop notify)
+    Notify {
+        /// Notification title
+        #[arg(long, default_value = "cmux")]
+        title: String,
+        /// Notification body
+        #[arg(long, default_value = "")]
+        body: String,
+        /// Target workspace UUID (default: active workspace)
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Skip the desktop notification (notify-send)
+        #[arg(long)]
+        no_desktop: bool,
+    },
+    /// Install session-capture hooks for agent CLIs (Claude Code, ...)
+    #[command(subcommand)]
+    Hooks(HooksCommand),
+    /// List captured agent sessions (provider, session id, resumable)
+    AgentSessions,
+    /// Agent session helpers (mostly invoked by hooks)
+    #[command(subcommand)]
+    Agent(AgentCommand),
+    /// Subscribe to the event stream (newline-delimited JSON events)
+    Events {
+        /// Comma-separated event names to include (e.g.
+        /// "notification.created,surface.bell"). Default: all events.
+        #[arg(long)]
+        name: Option<String>,
+        /// Exit after this many events
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Suppress heartbeat lines
+        #[arg(long)]
+        no_heartbeat: bool,
+    },
+
     // -- Browser subcommand group (agent primary interface) --
     /// Browser automation (agent primary interface)
     #[command(subcommand)]
     Browser(BrowserCommand),
 
+}
+
+/// `cmux hooks <action>` — manage agent session-capture hooks.
+#[derive(Subcommand)]
+pub enum HooksCommand {
+    /// Install session-capture hooks into agent CLI configs
+    Setup {
+        /// Assume yes to prompts (accepted for macOS parity; always yes here)
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// `cmux agent <action>` — agent session helpers.
+#[derive(Subcommand)]
+pub enum AgentCommand {
+    /// Report a captured native session id (invoked by the SessionStart hook;
+    /// reads the provider's hook JSON on stdin, uses $CMUX_PANE)
+    ReportSession,
 }
 
 /// Browser subcommands for `cmux browser <action>` / `cmux browser <surface> <action>`.
@@ -415,6 +523,57 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
 
     let use_color = format::use_color(&cli.color);
 
+    // Agent report-session: invoked by the provider's SessionStart hook.
+    // Reads the hook's JSON from stdin (for session_id) and the CMUX_PANE env
+    // var cmux set when it launched the agent (for the target surface).
+    if let Commands::Agent(AgentCommand::ReportSession) = cli.command {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        let _ = std::io::stdin().read_to_string(&mut buf);
+        let hook: serde_json::Value = serde_json::from_str(&buf).unwrap_or(serde_json::Value::Null);
+        let session_id = hook
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let surface = std::env::var("CMUX_PANE").unwrap_or_default();
+        if surface.is_empty() || session_id.is_empty() {
+            // Not in an agent pane, or no id — succeed quietly so we never
+            // break the agent's startup.
+            return Ok(());
+        }
+        let _ = client.call(
+            "agent.report_session",
+            serde_json::json!({
+                "surface": surface,
+                "provider": "claude",
+                "session_id": session_id,
+            }),
+        );
+        return Ok(());
+    }
+
+    // Handle Events separately: it streams newline-delimited JSON until the
+    // server closes the connection (--limit) or the pipe breaks.
+    if let Commands::Events { ref name, limit, no_heartbeat } = cli.command {
+        let mut params = serde_json::Map::new();
+        if let Some(ref n) = name {
+            params.insert("name".into(), serde_json::json!(n));
+        }
+        if let Some(l) = limit {
+            params.insert("limit".into(), serde_json::json!(l));
+        }
+        params.insert("heartbeat".into(), serde_json::json!(!no_heartbeat));
+
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout();
+        client.subscribe(serde_json::Value::Object(params), |line| {
+            // A broken pipe (e.g. `| head -1`) ends the stream cleanly.
+            writeln!(stdout, "{}", line).is_ok() && stdout.flush().is_ok()
+        })?;
+        return Ok(());
+    }
+
     // Handle Raw command separately (dynamic method name)
     let (method_name, result) = if let Commands::Raw { ref method, ref params } = cli.command {
         let params_val: serde_json::Value = serde_json::from_str(params).map_err(|e| {
@@ -568,7 +727,41 @@ fn command_to_rpc(cmd: &Commands) -> (&'static str, serde_json::Value) {
 
         Commands::Raw { .. } => unreachable!("Raw handled separately"),
 
-        Commands::NewWorkspace => ("workspace.create", json!({})),
+        Commands::NewWorkspace { name, cwd, layout, agent } => {
+            let mut p = serde_json::Map::new();
+            if let Some(ref n) = name {
+                p.insert("name".into(), json!(n));
+            }
+            if let Some(ref d) = cwd {
+                p.insert("cwd".into(), json!(d));
+            }
+            // --agent is sugar for a single-terminal agent layout.
+            if let Some(ref a) = agent {
+                let mut term = serde_json::Map::new();
+                term.insert("type".into(), json!("terminal"));
+                term.insert("agent".into(), json!(a));
+                if let Some(ref d) = cwd {
+                    term.insert("cwd".into(), json!(d));
+                }
+                p.insert("layout".into(), Value::Object(term));
+                return ("workspace.create", Value::Object(p));
+            }
+            if let Some(ref l) = layout {
+                match serde_json::from_str::<Value>(l) {
+                    Ok(v) => {
+                        p.insert("layout".into(), v);
+                    }
+                    Err(e) => {
+                        // Surface the parse error via the server's validation
+                        // path (send the raw string; server rejects objects
+                        // only, so reject here instead).
+                        eprintln!("error: --layout is not valid JSON: {}", e);
+                        std::process::exit(2);
+                    }
+                }
+            }
+            ("workspace.create", Value::Object(p))
+        }
         Commands::SelectWorkspace { id } => ("workspace.select", json!({"id": id})),
         Commands::CloseWorkspace { id } => ("workspace.close", json!({"id": id})),
         Commands::RenameWorkspace { id, name } => {
@@ -608,10 +801,13 @@ fn command_to_rpc(cmd: &Commands) -> (&'static str, serde_json::Value) {
             }
             ("surface.send_key", Value::Object(p))
         }
-        Commands::ReadText { id } => {
+        Commands::ReadText { id, scrollback } => {
             let mut p = serde_json::Map::new();
             if let Some(ref id) = id {
                 p.insert("id".into(), json!(id));
+            }
+            if *scrollback {
+                p.insert("scrollback".into(), json!(true));
             }
             ("surface.read_text", Value::Object(p))
         }
@@ -650,6 +846,51 @@ fn command_to_rpc(cmd: &Commands) -> (&'static str, serde_json::Value) {
         Commands::ClearNotification { id } => {
             ("notification.clear", json!({"id": id}))
         }
+        Commands::Hooks(HooksCommand::Setup { .. }) => ("agent.hooks_setup", json!({})),
+        Commands::AgentSessions => ("agent.list", json!({})),
+        // Agent(ReportSession) is handled by a dedicated stdin path in run().
+        Commands::Agent(AgentCommand::ReportSession) => ("agent.report_session", json!({})),
+        Commands::SetStatus { state, color, workspace } => {
+            let mut p = serde_json::Map::new();
+            p.insert("state".into(), json!(state));
+            p.insert("color".into(), json!(color));
+            if let Some(ref ws) = workspace {
+                p.insert("workspace".into(), json!(ws));
+            }
+            ("workspace.set_status", Value::Object(p))
+        }
+        Commands::SetProgress { value, label, workspace } => {
+            let mut p = serde_json::Map::new();
+            p.insert("value".into(), json!(value));
+            if let Some(ref l) = label {
+                p.insert("label".into(), json!(l));
+            }
+            if let Some(ref ws) = workspace {
+                p.insert("workspace".into(), json!(ws));
+            }
+            ("workspace.set_progress", Value::Object(p))
+        }
+        Commands::Log { message, workspace } => {
+            let mut p = serde_json::Map::new();
+            p.insert("message".into(), json!(message));
+            if let Some(ref ws) = workspace {
+                p.insert("workspace".into(), json!(ws));
+            }
+            ("workspace.log", Value::Object(p))
+        }
+        Commands::Notify { title, body, workspace, no_desktop } => {
+            let mut p = serde_json::Map::new();
+            p.insert("title".into(), json!(title));
+            p.insert("body".into(), json!(body));
+            if let Some(ref ws) = workspace {
+                p.insert("workspace".into(), json!(ws));
+            }
+            p.insert("desktop".into(), json!(!no_desktop));
+            ("notification.create", Value::Object(p))
+        }
+        // Events is handled by a dedicated streaming path in run(); this arm
+        // is unreachable but keeps the match exhaustive.
+        Commands::Events { .. } => ("events.subscribe", json!({})),
 
         Commands::Browser(cmd) => browser_command_to_rpc(cmd),
     }

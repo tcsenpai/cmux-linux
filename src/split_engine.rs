@@ -395,16 +395,33 @@ impl SplitEngine {
             return None;
         }
         match data {
-            SplitNodeData::Leaf { surface_uuid, .. } => {
+            SplitNodeData::Leaf { surface_uuid, agent_provider, agent_session_id, cwd, .. } => {
                 let pane_id = *next_pane_id;
                 *next_pane_id += 1;
-                // Create surface — realize callback will create Ghostty surface and wire registries
+                // Create surface in the leaf's saved directory (session
+                // restore, declarative layouts, and agent surfaces all flow
+                // through here). Shell starts there, so splits off it inherit
+                // the right cwd and agents find their per-project session.
+                let leaf_cwd = if cwd.is_empty() { None } else { Some(cwd.clone()) };
                 let (gl_area, _surface_cell) =
-                    crate::ghostty::surface::create_surface(app, ghostty_app, None, pane_id, crate::ghostty::surface::SurfaceIoMode::Exec);
+                    crate::ghostty::surface::create_surface(app, ghostty_app, None, pane_id, crate::ghostty::surface::SurfaceIoMode::Exec, leaf_cwd);
                 // Phase 9: Attach right-click context menu (D-08)
                 attach_terminal_context_menu(&gl_area);
                 // D-06: preserve UUID from session
                 let uuid = *surface_uuid;
+                // Re-register agent surfaces so resume + re-save survive restart.
+                if let Some(p) = agent_provider
+                    .as_deref()
+                    .and_then(crate::agent::Provider::from_str)
+                {
+                    let resume_cwd = if cwd.is_empty() { None } else { Some(cwd.clone()) };
+                    crate::agent::register(
+                        &uuid.to_string(),
+                        p,
+                        agent_session_id.clone(),
+                        resume_cwd,
+                    );
+                }
                 let surface_placeholder: ffi::ghostty_surface_t = std::ptr::null_mut();
                 Some(SplitNode::Leaf {
                     pane_id,
@@ -604,6 +621,9 @@ impl SplitEngine {
             Some(inherited_config),
             new_pane_id,
             crate::ghostty::surface::SurfaceIoMode::Exec,
+            // cwd inherited via inherited_config (parent starts in the right
+            // directory now, so ghostty_surface_inherited_config carries it).
+            None,
         );
         // Phase 9: Attach right-click context menu (D-08)
         attach_terminal_context_menu(&new_gl_area);
@@ -913,9 +933,6 @@ impl SplitEngine {
             return None; // Prevent closing last terminal; close workspace instead
         }
 
-        // Find the surface before removing it from the tree.
-        let surface_to_free = self.find_surface(active_id)?;
-
         // Capture the raw GLArea pointer BEFORE the tree removal drops the GObject.
         // GL_AREA_REGISTRY holds raw pointers; once GTK finalizes the GObject the
         // pointer becomes dangling. Remove it here while the GLArea is still alive.
@@ -938,13 +955,11 @@ impl SplitEngine {
             }
         }
 
-        // Deregister from SURFACE_REGISTRY and free the surface.
-        unsafe {
-            ffi::ghostty_surface_free(surface_to_free);
-        }
-        if let Ok(mut registry) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-            registry.remove(&(surface_to_free as usize));
-        }
+        // The ghostty surface is NOT freed here: the GLArea unrealize handler
+        // owns it (realize creates, unrealize frees + deregisters), and the
+        // tree removal above unparented the GLArea, which unrealizes it.
+        // Freeing here too double-frees whenever the tree pointer is live
+        // (e.g. after sync_surfaces_from_registry on session restore).
 
         // Update focus to the surviving pane.
         self.active_pane_id = surviving_id;
@@ -1018,6 +1033,16 @@ impl SplitEngine {
 
     fn find_gl_area(&self, pane_id: u64) -> Option<gtk4::GLArea> {
         find_gl_area_in_tree(&self.root, pane_id)
+    }
+
+    /// Current on-screen size (logical px) of a pane's terminal widget, if it
+    /// is realized and allocated. Used to reject splits that would produce a
+    /// pane too small for its shell/TUI to render.
+    pub fn pane_size(&self, pane_id: u64) -> Option<(i32, i32)> {
+        use gtk4::prelude::*;
+        let area = self.find_gl_area(pane_id)?;
+        let (w, h) = (area.width(), area.height());
+        if w > 0 && h > 0 { Some((w, h)) } else { None }
     }
 
     /// Returns all leaf panes in this engine as (uuid, pane_id, active) tuples.
@@ -1459,6 +1484,14 @@ pub enum SplitNodeData {
         shell: String,
         /// Absolute working directory path (best-effort; may be empty if /proc unavailable)
         cwd: String,
+        /// Agent provider running in this pane, if it's a native agent
+        /// surface (e.g. "claude"). None for plain shells.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_provider: Option<String>,
+        /// Captured native session id for resume, if the agent's hook has
+        /// reported one. None until captured.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_session_id: Option<String>,
     },
     Split {
         /// "horizontal" or "vertical"
@@ -1532,13 +1565,25 @@ impl SplitNode {
     pub fn to_data(&self) -> SplitNodeData {
         match self {
             SplitNode::Leaf { pane_id, uuid, surface, .. } => {
-                let cwd = get_surface_cwd(*surface);
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                let agent = crate::agent::get(&uuid.to_string());
+                // For agent surfaces, the registry holds the authoritative
+                // launch cwd (agents key their session store by project dir,
+                // and get_surface_cwd is a best-effort /proc guess that can't
+                // reliably map a surface to its own child). Fall back to the
+                // /proc guess for plain shells.
+                let cwd = agent
+                    .as_ref()
+                    .and_then(|a| a.cwd.clone())
+                    .filter(|c| !c.is_empty())
+                    .unwrap_or_else(|| get_surface_cwd(*surface));
                 SplitNodeData::Leaf {
                     pane_id: *pane_id,
                     surface_uuid: *uuid,
                     shell,
                     cwd,
+                    agent_provider: agent.as_ref().map(|a| a.provider.as_str().to_string()),
+                    agent_session_id: agent.and_then(|a| a.session_id),
                 }
             },
             SplitNode::Preview { .. } => {
@@ -1549,6 +1594,8 @@ impl SplitNode {
                     surface_uuid: Uuid::nil(),
                     shell: String::new(),
                     cwd: String::new(),
+                    agent_provider: None,
+                    agent_session_id: None,
                 }
             },
             SplitNode::Split { orientation, paned, start, end, .. } => {
