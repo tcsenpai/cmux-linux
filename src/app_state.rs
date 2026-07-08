@@ -89,6 +89,12 @@ impl AppState {
     /// page to the GtkStack. The actual GLArea/split root is added by the caller (Plan 04).
     /// Returns the new workspace id.
     pub fn create_workspace(&mut self) -> u64 {
+        self.create_workspace_in(None)
+    }
+
+    /// Create a new workspace whose first pane's shell starts in `cwd`.
+    /// `cwd = None` starts in the shell's default directory.
+    pub fn create_workspace_in(&mut self, cwd: Option<String>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let display_number = self.next_display_number;
@@ -114,7 +120,7 @@ impl AppState {
             id, pane_id
         );
         let (gl_area, surface_cell) =
-            crate::ghostty::surface::create_surface(&self.gtk_app, self.ghostty_app, None, pane_id, crate::ghostty::surface::SurfaceIoMode::Exec);
+            crate::ghostty::surface::create_surface(&self.gtk_app, self.ghostty_app, None, pane_id, crate::ghostty::surface::SurfaceIoMode::Exec, cwd);
         let engine = SplitEngine::new(
             self.gtk_app.clone(),
             self.ghostty_app,
@@ -243,6 +249,7 @@ impl AppState {
             None,
             pane_id,
             crate::ghostty::surface::SurfaceIoMode::Manual { io_write_ctx: io_ctx.clone() },
+            None,
         );
         let engine = SplitEngine::new(
             self.gtk_app.clone(),
@@ -298,7 +305,11 @@ impl AppState {
 
     /// Close the workspace at `index`. Removes the sidebar row and GtkStack page.
     /// Returns false if there is only one workspace (cannot close the last one).
-    /// The caller (Plan 04) is responsible for calling ghostty_surface_free on all panes first.
+    /// Ghostty surfaces are NOT freed here: the GLArea unrealize handler owns
+    /// each surface (realize creates it, unrealize frees it), and removing the
+    /// GtkStack page below unrealizes every GLArea in the workspace. Freeing
+    /// here too double-frees any pointer the split tree knows about (e.g.
+    /// after sync_surfaces_from_registry on session restore).
     pub fn close_workspace(&mut self, index: usize) -> bool {
         if self.workspaces.len() <= 1 {
             return false; // Cannot close the last workspace
@@ -311,21 +322,6 @@ impl AppState {
             }
         }
 
-        // Before removing from workspaces, free all Ghostty surfaces in the split engine.
-        if let Some(engine) = self.split_engines.get(index) {
-            let mut surfaces = Vec::new();
-            engine.root.collect_surfaces(&mut surfaces);
-            for surface in surfaces {
-                if !surface.is_null() {
-                    unsafe {
-                        crate::ghostty::ffi::ghostty_surface_free(surface);
-                    }
-                    if let Ok(mut reg) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-                        reg.remove(&(surface as usize));
-                    }
-                }
-            }
-        }
         self.split_engines.remove(index);
 
         let workspace = self.workspaces.remove(index);
@@ -488,7 +484,7 @@ impl AppState {
     }
 
     /// Update the sidebar dot visibility for workspace at `index`.
-    fn update_sidebar_attention(&self, index: usize) {
+    pub(crate) fn update_sidebar_attention(&self, index: usize) {
         if let Some(row) = self.sidebar_list.row_at_index(index as i32) {
             let has_attention = self.workspaces.get(index)
                 .map(|ws| ws.has_attention)
@@ -532,6 +528,8 @@ impl AppState {
                                 surface_uuid: uuid::Uuid::nil(),
                                 shell: String::new(),
                                 cwd: String::new(),
+                                agent_provider: None,
+                                agent_session_id: None,
                             }
                         };
                         // D-04: save active_pane_uuid per workspace
