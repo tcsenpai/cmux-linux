@@ -313,17 +313,10 @@ impl AppState {
 
         // Before removing from workspaces, free all Ghostty surfaces in the split engine.
         if let Some(engine) = self.split_engines.get(index) {
-            let mut surfaces = Vec::new();
-            engine.root.collect_surfaces(&mut surfaces);
-            for surface in surfaces {
-                if !surface.is_null() {
-                    unsafe {
-                        crate::ghostty::ffi::ghostty_surface_free(surface);
-                    }
-                    if let Ok(mut reg) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-                        reg.remove(&(surface as usize));
-                    }
-                }
+            let mut gl_areas = Vec::new();
+            engine.root.collect_gl_areas(&mut gl_areas);
+            for gl_area in &gl_areas {
+                crate::ghostty::surface::destroy_surface(gl_area);
             }
         }
         self.split_engines.remove(index);

@@ -80,20 +80,19 @@ biggest chunk.
 
 ## Open work (the contents of myc epic #1)
 
-### 1. Restore the two surface lifecycle exports
+### 1. ~~Restore the two surface lifecycle exports~~ (resolved without them)
 
-`src/ghostty/surface.rs` has two `TODO(cmux-linux)` stubs for
-`ghostty_surface_display_realized` / `..._unrealized`. Resolve by one of:
+Resolved in cmux itself, with no ghostty fork change: each terminal GLArea
+now supplies its own GL context through `create-context` and keeps a
+reference to it, so a reparent re-realizes into the same context and the
+ghostty surface is reattached instead of freed (#11). Surfaces are freed
+only through `surface::destroy_surface`, or once a pane is still detached
+after the main-loop iteration that unrealized it. See the `PaneSurface`
+doc comment in `src/ghostty/surface.rs`.
 
-- (a) Open a manaflow-ai/ghostty branch that re-exports
-  `renderer.displayRealized()` / `displayUnrealized()` through
-  `src/apprt/embedded.zig`, then bump the parent-repo submodule
-  pointer; **or**
-- (b) Replace the call sites with whatever lifecycle hook upstream
-  currently uses for GTK4 GLArea reparent.
-
-(a) is cheaper but requires push access to the manaflow-ai/ghostty
-fork. (b) is more durable.
+The `displayRealized()` / `displayUnrealized()` re-export is still the
+route if a pane ever has to move between windows (a different GdkSurface
+needs a new context); today that case falls back to recreating the surface.
 
 ### 2. Finish Tier-2 browser RPC dispatch
 

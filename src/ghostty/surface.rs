@@ -29,6 +29,96 @@ extern "C" {
 const GL_VIEWPORT: u32 = 0x0BA2;
 const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
 
+/// GObject data key under which each terminal GLArea carries its `PaneSurface`.
+const PANE_SURFACE_KEY: &str = "cmux-pane-surface";
+
+/// Everything a terminal pane owns: the ghostty surface, the SSH userdata Arc
+/// handed to it, and the GL context its renderer's GPU objects live in.
+///
+/// The GL context is kept here on purpose. GTK unrealizes a GLArea whenever it
+/// is unparented (every split and every pane close moves widgets between
+/// GtkPaned/GtkStack parents) and drops its own context reference. Holding a
+/// reference ourselves and handing the same context back from `create-context`
+/// keeps ghostty's VAOs, textures and shaders valid across the reparent, so the
+/// surface — and the shell process behind it — survives. See issue #11.
+struct PaneSurface {
+    surface: Rc<RefCell<Option<ffi::ghostty_surface_t>>>,
+    ssh_userdata: Rc<RefCell<Option<*const crate::ssh::bridge::IoWriteContext>>>,
+    gl_context: RefCell<Option<gtk4::gdk::GLContext>>,
+}
+
+impl PaneSurface {
+    /// Free the ghostty surface and release the retained GL context.
+    /// Idempotent: every path that tears a pane down (pane close, workspace
+    /// close, the deferred check after a final unrealize) calls this, and only
+    /// the first call frees anything.
+    fn destroy(&self, area_ptr: usize) {
+        use crate::ghostty::callbacks::{self, SURFACE_PTR};
+        use gtk4::prelude::GLContextExt;
+        use std::sync::atomic::Ordering;
+
+        if let Ok(mut areas) = callbacks::GL_AREA_REGISTRY.lock() {
+            areas.retain(|p| p.0 as usize != area_ptr);
+        }
+        if let Ok(mut gl_to_surface) = callbacks::GL_TO_SURFACE.lock() {
+            gl_to_surface.remove(&area_ptr);
+        }
+
+        let Some(surface) = self.surface.borrow_mut().take() else {
+            self.gl_context.borrow_mut().take();
+            return;
+        };
+        eprintln!("cmux: destroying ghostty surface {:p}", surface);
+        if let Ok(mut registry) = callbacks::SURFACE_REGISTRY.lock() {
+            registry.remove(&(surface as usize));
+        }
+        // Zero the clipboard callbacks' global if it points here, so the next
+        // clipboard event early-returns instead of dereferencing freed memory.
+        let _ =
+            SURFACE_PTR.compare_exchange(surface as usize, 0, Ordering::SeqCst, Ordering::SeqCst);
+        // Drop the SSH io_write_userdata Arc BEFORE freeing the surface —
+        // ghostty.h exposes no destructor for it, so we own the drop.
+        if let Some(ctx_raw) = self.ssh_userdata.borrow_mut().take() {
+            unsafe {
+                std::sync::Arc::from_raw(ctx_raw);
+            }
+        }
+        // Free with the surface's own GL context current so the renderer can
+        // delete its GPU objects in the context that created them.
+        let gl_context = self.gl_context.borrow_mut().take();
+        if let Some(ctx) = &gl_context {
+            ctx.make_current();
+        }
+        unsafe {
+            ffi::ghostty_surface_free(surface);
+        }
+        if gl_context.is_some() {
+            gtk4::gdk::GLContext::clear_current();
+        }
+    }
+}
+
+fn pane_surface(gl_area: &gtk4::GLArea) -> Option<Rc<PaneSurface>> {
+    use gtk4::prelude::ObjectExt;
+    // SAFETY: PANE_SURFACE_KEY is only ever set by create_surface, always with
+    // an Rc<PaneSurface>, and only read on the GLib main thread.
+    unsafe {
+        gl_area
+            .data::<Rc<PaneSurface>>(PANE_SURFACE_KEY)
+            .map(|p| p.as_ref().clone())
+    }
+}
+
+/// Free the terminal surface owned by `gl_area` (no-op if already freed or if
+/// the widget is not a terminal pane). The single teardown path for callers
+/// that close panes or workspaces; never call `ghostty_surface_free` directly.
+pub fn destroy_surface(gl_area: &gtk4::GLArea) {
+    use gtk4::prelude::ObjectType;
+    if let Some(pane) = pane_surface(gl_area) {
+        pane.destroy(gl_area.as_ptr() as usize);
+    }
+}
+
 /// Creates and returns a GtkGLArea with a Ghostty terminal surface wired up.
 /// Initializes ghostty_app_t, then defers ghostty_surface_t creation to the
 /// GtkGLArea realize signal — when the GL context is guaranteed to exist.
@@ -84,6 +174,64 @@ pub fn create_surface(
     let ssh_userdata_cell: Rc<RefCell<Option<*const crate::ssh::bridge::IoWriteContext>>> =
         Rc::new(RefCell::new(None));
 
+    let pane = Rc::new(PaneSurface {
+        surface: surface_cell.clone(),
+        ssh_userdata: ssh_userdata_cell.clone(),
+        gl_context: RefCell::new(None),
+    });
+    // SAFETY: read back only through pane_surface(), with the same type.
+    unsafe {
+        gl_area.set_data(PANE_SURFACE_KEY, pane.clone());
+    }
+
+    // ── GtkGLArea::create-context ────────────────────────────────────────────
+    // Mirrors GTK's default handler, except that the context is retained in
+    // `pane` and handed back on every later realize of this widget, so a
+    // reparent does not destroy the GL objects of a live ghostty surface.
+    // A context bound to a different GdkSurface (the pane moved to another
+    // window) cannot be reused; a fresh one is created and realize falls back
+    // to recreating the ghostty surface.
+    gl_area.connect_create_context({
+        let pane = pane.clone();
+        move |area| {
+            let native_surface = area.native().and_then(|n| n.surface());
+            if let Some(ctx) = pane.gl_context.borrow().as_ref() {
+                let ctx_surface = gtk4::prelude::DrawContextExt::surface(ctx);
+                if ctx_surface.is_some() && ctx_surface == native_surface {
+                    return Some(ctx.clone());
+                }
+            }
+            let Some(native_surface) = native_surface else {
+                area.set_error(Some(&glib::Error::new(
+                    gtk4::gdk::GLError::NotAvailable,
+                    "GLArea has no native surface",
+                )));
+                return None;
+            };
+            let ctx = match native_surface.create_gl_context() {
+                Ok(ctx) => ctx,
+                Err(err) => {
+                    area.set_error(Some(&err));
+                    return None;
+                }
+            };
+            ctx.set_allowed_apis(area.allowed_apis());
+            let (major, minor) = area.required_version();
+            ctx.set_required_version(major, minor);
+            if let Err(err) = ctx.realize() {
+                area.set_error(Some(&err));
+                return None;
+            }
+            // A previous context only gets replaced here when the pane moved to
+            // another window; realize sees the mismatch and recreates the
+            // surface, freeing the old one with the old context current.
+            if pane.gl_context.borrow().is_none() {
+                *pane.gl_context.borrow_mut() = Some(ctx.clone());
+            }
+            Some(ctx)
+        }
+    });
+
     // ── GtkGLArea::realize ───────────────────────────────────────────────────
     // GL context is now valid. Create the surface HERE so ghostty can access
     // the GL context immediately after creation (fixes segfault in set_content_scale).
@@ -95,6 +243,7 @@ pub fn create_surface(
     gl_area.connect_realize({
         let cell = surface_cell.clone();
         let userdata_cell = ssh_userdata_cell.clone();
+        let pane_realize = pane.clone();
         let io_mode = io_mode;
         move |area| {
             eprintln!(
@@ -108,8 +257,10 @@ pub fn create_surface(
                 std::process::exit(1); // Per D-09: no GUI error dialog in Phase 1
             }
 
-            // Check if surface already exists (re-realize after reparent).
-            // If so, just update the size/scale and refresh — don't create a new surface.
+            // Re-realize after a reparent (split, pane close collapsing a split).
+            // create-context handed back the context this surface's GPU objects
+            // live in, so the surface is still valid: reattach it instead of
+            // creating a new one, which would kill the shell behind it (#11).
             //
             // DO NOT restore focus here. During a split, the old pane is reparented into
             // a GtkPaned — it should NOT regain focus. The new pane gets focus via its own
@@ -118,41 +269,39 @@ pub fn create_surface(
             // (via `enter` signal). Calling set_focus(true) here incorrectly marks the old
             // pane as focused, causing both panes to have focused=true simultaneously and
             // triggering Ghostty's early-return guard on the new pane's subsequent focus calls.
-            // On re-realize, the prior GL context was destroyed in unrealize
-            // and `cell` should be None (unrealize frees the surface). If a
-            // surface is still cached here, that means unrealize was bypassed
-            // (shouldn't happen with the current GTK lifecycle, but defend
-            // against it): free it before falling through to fresh creation.
-            //
-            // We previously kept the old surface and called
-            // `ghostty_surface_display_realized` to re-init GL state in place,
-            // but that export was dropped from manaflow-ai/ghostty when the
-            // pinned SHA (4845e82d) became unreachable. Reusing the cached
-            // surface against a brand-new GL context is undefined behavior
-            // (textures/FBOs/shaders refer to a context that no longer exists).
-            // Until embedded.zig re-exports displayRealized()/displayUnrealized()
-            // (Phase C), the correct fallback is to allocate a fresh surface.
-            // See myc task #1 (see docs/phase-c-plan.md §1).
-            if let Some(stale_surface) = cell.borrow_mut().take() {
-                eprintln!(
-                    "cmux: GLArea {:p} re-realized with cached surface {:p} — freeing and re-creating (display_realized export missing)",
-                    area.as_ptr(),
-                    stale_surface,
-                );
-                if let Ok(mut registry) = callbacks::SURFACE_REGISTRY.lock() {
-                    registry.remove(&(stale_surface as usize));
-                }
-                // Drop the SSH io_write_userdata Arc, if any, BEFORE freeing
-                // the surface — once freed, ghostty's destructor may walk the
-                // userdata pointer for its own cleanup.
-                if let Some(ctx_raw) = userdata_cell.borrow_mut().take() {
-                    unsafe {
-                        std::sync::Arc::from_raw(ctx_raw);
+            let existing = *cell.borrow();
+            if let Some(surface) = existing {
+                let same_context = area.context().is_some()
+                    && area.context() == *pane_realize.gl_context.borrow();
+                if same_context {
+                    eprintln!(
+                        "cmux: GLArea {:p} re-realized — reattaching surface {:p}",
+                        area.as_ptr(),
+                        surface,
+                    );
+                    if let Ok(mut areas) = callbacks::GL_AREA_REGISTRY.lock() {
+                        let raw_ptr = area.as_ptr();
+                        if !areas.iter().any(|p| p.0 == raw_ptr) {
+                            areas.push(callbacks::GtkGLAreaPtr(raw_ptr));
+                        }
                     }
+                    if let Ok(mut gl_to_surface) = callbacks::GL_TO_SURFACE.lock() {
+                        gl_to_surface.insert(area.as_ptr() as usize, surface as usize);
+                    }
+                    area.queue_render();
+                    return;
                 }
-                unsafe {
-                    ffi::ghostty_surface_free(stale_surface);
-                }
+                // The context changed (the pane moved to another window): the
+                // surface's GPU objects belong to the old context, so it cannot
+                // be reused. Free it with the old context current, then fall
+                // through and create a fresh surface in the new one.
+                eprintln!(
+                    "cmux: GLArea {:p} re-realized in a new GL context — recreating surface",
+                    area.as_ptr(),
+                );
+                pane_realize.destroy(area.as_ptr() as usize);
+                *pane_realize.gl_context.borrow_mut() = area.context();
+                area.make_current();
             }
 
             eprintln!("cmux: GL context made current, no error");
@@ -283,66 +432,44 @@ pub fn create_surface(
         }
     });
 
-    // ── GtkGLArea::unrealize — free renderer GL resources before context dies
+    // ── GtkGLArea::unrealize ─────────────────────────────────────────────────
+    // GTK unrealizes the area every time it is unparented — on every split and
+    // every pane close, not only when the pane goes away. Stop rendering into it
+    // now, but keep the surface: `pane` holds the GL context, so its GPU objects
+    // stay valid and the next realize reattaches it. If the widget is still
+    // detached once the current main-loop iteration has finished (a closed pane,
+    // a closed workspace or window), nothing is coming back for it, so free it
+    // then. Reparents finish synchronously within one handler, so they are
+    // always back in a rooted tree by the time the idle runs.
     {
         let pane_id_unrealize = pane_id;
-        let cell_unrealize = surface_cell.clone();
-        let userdata_unrealize = ssh_userdata_cell.clone();
+        let pane_unrealize = pane.clone();
         gl_area.connect_unrealize(move |area| {
             eprintln!(
-                "cmux: GLArea {:p} pane={} UNREALIZE — freeing GL resources",
+                "cmux: GLArea {:p} pane={} unrealize",
                 area.as_ptr(),
                 pane_id_unrealize,
             );
-            // Make GL context current so Ghostty can properly free GL objects.
-            area.make_current();
-            // Take the surface out of the cell — it must not survive the GL
-            // context teardown. Until ghostty re-exports
-            // `ghostty_surface_display_unrealized` (Phase C, myc task #1 (see docs/phase-c-plan.md §1)),
-            // there is no in-place "release GL state but keep surface" path:
-            // the surface internally holds renderer state keyed to the GL
-            // context that is about to die. Free the whole surface; the next
-            // realize allocates a fresh one. This loses keep-alive state
-            // (scrollback retention across reparent) but avoids the UB of
-            // reusing GPU handles minted for a destroyed context.
             // Drop this GLArea from the wakeup registry FIRST — wakeup_cb runs
-            // off the main thread and is the loudest stale-pointer consumer.
-            // The free-surface block below tears down ghostty state next.
-            let area_raw = area.as_ptr() as *mut gtk4::ffi::GtkGLArea;
+            // off the main thread and would queue renders on an unrealized area.
+            let area_ptr = area.as_ptr() as usize;
             if let Ok(mut areas) = callbacks::GL_AREA_REGISTRY.lock() {
-                areas.retain(|p| p.0 != area_raw);
+                areas.retain(|p| p.0 as usize != area_ptr);
             }
             if let Ok(mut gl_to_surface) = callbacks::GL_TO_SURFACE.lock() {
-                gl_to_surface.remove(&(area.as_ptr() as usize));
+                gl_to_surface.remove(&area_ptr);
             }
 
-            if let Some(surface) = cell_unrealize.borrow_mut().take() {
-                eprintln!(
-                    "cmux: freeing ghostty surface {:p} on unrealize",
-                    surface,
-                );
-                if let Ok(mut registry) = callbacks::SURFACE_REGISTRY.lock() {
-                    registry.remove(&(surface as usize));
+            let weak_area = area.downgrade();
+            let pane = pane_unrealize.clone();
+            glib::idle_add_local_once(move || {
+                let still_attached = weak_area
+                    .upgrade()
+                    .is_some_and(|a| a.is_realized() || a.root().is_some());
+                if !still_attached {
+                    pane.destroy(area_ptr);
                 }
-                // Clear the stale-SURFACE_PTR window for the clipboard
-                // callbacks: if it pointed at this surface, zero it so the
-                // next clipboard event early-returns instead of dereferencing
-                // a freed pointer. The callbacks must check for 0/null.
-                let surface_as_usize = surface as usize;
-                if SURFACE_PTR.load(Ordering::SeqCst) == surface_as_usize {
-                    SURFACE_PTR.store(0, Ordering::SeqCst);
-                }
-                // Drop the SSH io_write_userdata Arc BEFORE freeing the
-                // surface — see realize for the rationale.
-                if let Some(ctx_raw) = userdata_unrealize.borrow_mut().take() {
-                    unsafe {
-                        std::sync::Arc::from_raw(ctx_raw);
-                    }
-                }
-                unsafe {
-                    ffi::ghostty_surface_free(surface);
-                }
-            }
+            });
         });
     }
 

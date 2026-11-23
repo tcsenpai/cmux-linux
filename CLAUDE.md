@@ -86,12 +86,14 @@ with the Swift sources.
 - **No separate simdutf.o / libhighway.a / stubs.o linking.** Those live
   inside `ghostty-internal.a`; pulling them in separately produces duplicate
   symbols. The historic build.rs lookup code is documented but disabled.
-- **API drift TODOs.** Two surface-lifecycle exports
-  (`ghostty_surface_display_realized` / `..._unrealized`) were available on
-  the old fork pin but were not re-exported on current ghostty main. The Rust
-  call sites in `src/ghostty/surface.rs` are stubbed with `TODO(cmux-linux)`
-  comments — Phase C must restore them via fresh ghostty fork commits or
-  switch to the new lifecycle API.
+- **Surface lifecycle.** GTK unrealizes a GLArea on every reparent (each
+  split and pane close). A terminal's ghostty surface survives that because
+  the pane keeps its own GL context (`create-context` in
+  `src/ghostty/surface.rs`). Free surfaces only via
+  `ghostty::surface::destroy_surface`, never with `ghostty_surface_free`
+  directly: it is the single idempotent teardown path. The
+  `ghostty_surface_display_realized` / `..._unrealized` exports are still
+  missing; they would only matter for moving a pane to another window.
 - **Socket commands must not steal focus.** Only the explicit focus-intent
   commands (`window.focus`, `workspace.select/next/previous/last`,
   `surface.focus`, `pane.focus/last`, browser focus commands) may mutate UI

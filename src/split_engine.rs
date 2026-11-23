@@ -147,14 +147,14 @@ impl SplitNode {
         }
     }
 
-    /// Collect all surfaces into a Vec (for ghostty_surface_free on workspace close).
-    pub fn collect_surfaces(&self, out: &mut Vec<ffi::ghostty_surface_t>) {
+    /// Collect every terminal GLArea (for surface teardown on workspace close).
+    pub fn collect_gl_areas(&self, out: &mut Vec<gtk4::GLArea>) {
         match self {
-            SplitNode::Leaf { surface, .. } => out.push(*surface),
+            SplitNode::Leaf { gl_area, .. } => out.push(gl_area.clone()),
             SplitNode::Preview { .. } => {} // No Ghostty surface
             SplitNode::Split { start, end, .. } => {
-                start.collect_surfaces(out);
-                end.collect_surfaces(out);
+                start.collect_gl_areas(out);
+                end.collect_gl_areas(out);
             }
         }
     }
@@ -913,37 +913,18 @@ impl SplitEngine {
             return None; // Prevent closing last terminal; close workspace instead
         }
 
-        // Find the surface before removing it from the tree.
-        let surface_to_free = self.find_surface(active_id)?;
-
-        // Capture the raw GLArea pointer BEFORE the tree removal drops the GObject.
-        // GL_AREA_REGISTRY holds raw pointers; once GTK finalizes the GObject the
-        // pointer becomes dangling. Remove it here while the GLArea is still alive.
-        let raw_gl_area: Option<*mut gtk4::ffi::GtkGLArea> = self
-            .find_gl_area(active_id)
-            .map(|a| a.as_ptr() as *mut gtk4::ffi::GtkGLArea);
+        // Only terminal panes are closed here (a Preview has no surface).
+        self.find_surface(active_id)?;
+        let closing_gl_area = self.find_gl_area(active_id);
 
         // Remove the leaf from the tree and get the surviving sibling's pane_id.
         let surviving_id = remove_leaf_from_tree(&mut self.root, active_id)?;
 
-        // Remove the now-dropped GLArea from GL_AREA_REGISTRY before any further
-        // callbacks can dereference the dangling pointer (Gap 2 fix).
-        if let Some(raw_ptr) = raw_gl_area {
-            if let Ok(mut areas) = crate::ghostty::callbacks::GL_AREA_REGISTRY.lock() {
-                areas.retain(|p| p.0 != raw_ptr);
-            }
-            // Also remove from GL_TO_SURFACE mapping.
-            if let Ok(mut gl_to_surface) = crate::ghostty::callbacks::GL_TO_SURFACE.lock() {
-                gl_to_surface.remove(&(raw_ptr as usize));
-            }
-        }
-
-        // Deregister from SURFACE_REGISTRY and free the surface.
-        unsafe {
-            ffi::ghostty_surface_free(surface_to_free);
-        }
-        if let Ok(mut registry) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-            registry.remove(&(surface_to_free as usize));
+        // Free the closed pane's surface (and drop it from the wakeup and
+        // surface registries) through its single teardown path, so the
+        // deferred free after its final unrealize finds nothing left to free.
+        if let Some(gl_area) = &closing_gl_area {
+            crate::ghostty::surface::destroy_surface(gl_area);
         }
 
         // Update focus to the surviving pane.
@@ -1165,8 +1146,14 @@ fn replace_child_in_parent(
             .map(|w| w == old_widget)
             .unwrap_or(false)
         {
+            // new_widget is usually a child of old_widget (the Paned being
+            // collapsed). GtkPaned refuses a child that still has a parent and
+            // leaves the old Paned — with the closed pane's GLArea inside it —
+            // on screen, so unparent it first (#12).
+            remove_widget_from_parent(new_widget);
             paned.set_start_child(Some(new_widget));
         } else {
+            remove_widget_from_parent(new_widget);
             paned.set_end_child(Some(new_widget));
         }
     } else if let Some(stack) = parent.downcast_ref::<gtk4::Stack>() {
